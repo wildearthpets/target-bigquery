@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import decimal
 import io
 import sys
 import json
@@ -145,6 +146,8 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
             # NEWLINE_DELIMITED_JSON expects literal JSON formatted data, with a newline character splitting each row.
             new_record = {}
             for key, value in msg.record.items():
+                if isinstance(value, decimal.Decimal):
+                    value = float(value)
                 new_record[fix_name(key)] = value
             dat = bytes(json.dumps(new_record) + '\n', 'UTF-8')
 
