@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 
 import argparse
+import collections
+import http.client
 import io
-import sys
 import json
 import logging
-import collections
+import sys
 import threading
-import http.client
 import urllib
-import pkg_resources
-
-from jsonschema import validate
-import singer
-
-from oauth2client import tools
 from tempfile import TemporaryFile
+from typing import List
 
-from google.cloud import bigquery
-from google.cloud.bigquery.job import SourceFormat
-from google.cloud.bigquery import Dataset, WriteDisposition
-from google.cloud.bigquery import SchemaField
-from google.cloud.bigquery import LoadJobConfig
+import pkg_resources
+import singer
 from google.api_core import exceptions
+from google.cloud import bigquery
+from google.cloud.bigquery import Dataset, WriteDisposition
+from google.cloud.bigquery import LoadJobConfig
+from google.cloud.bigquery import SchemaField
+from google.cloud.bigquery.job import SourceFormat
+from jsonschema import validate
+from oauth2client import tools
 
 try:
     parser = argparse.ArgumentParser(parents=[tools.argparser])
@@ -35,11 +34,12 @@ except ImportError:
 logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
 logger = singer.get_logger()
 
-SCOPES = ['https://www.googleapis.com/auth/bigquery','https://www.googleapis.com/auth/bigquery.insertdata']
+SCOPES = ['https://www.googleapis.com/auth/bigquery', 'https://www.googleapis.com/auth/bigquery.insertdata']
 CLIENT_SECRET_FILE = 'client_secret.json'
 APPLICATION_NAME = 'Singer BigQuery Target'
 
 StreamMeta = collections.namedtuple('StreamMeta', ['schema', 'key_properties', 'bookmark_properties'])
+
 
 def emit_state(state):
     if state is not None:
@@ -48,11 +48,19 @@ def emit_state(state):
         sys.stdout.write("{}\n".format(line))
         sys.stdout.flush()
 
+
 def clear_dict_hook(items):
     return {k: v if v is not None else '' for k, v in items}
 
+
+def bq_field_sanitize(name):
+    if name[0].isdigit():
+        raise Exception("Field name can not start with digit: {}".format(name))
+    return name.replace('-', '_')
+
+
 def define_schema(field, name):
-    schema_name = name
+    schema_name = bq_field_sanitize(name)
     schema_type = "STRING"
     schema_mode = "NULLABLE"
     schema_description = None
@@ -64,7 +72,7 @@ def define_schema(field, name):
                 schema_mode = 'NULLABLE'
             else:
                 field = types
-            
+
     if isinstance(field['type'], list):
         if field['type'][0] == "null":
             schema_mode = 'NULLABLE'
@@ -74,38 +82,47 @@ def define_schema(field, name):
     else:
         schema_type = field['type']
     if schema_type == "object":
-        schema_type = "RECORD"
-        schema_fields = tuple(build_schema(field))
+        if "properties" not in field.keys():
+            schema_type = "string"
+        else:
+            schema_type = "RECORD"
+            schema_fields = tuple(build_schema(field))
+            if not schema_fields:
+                schema_type = "string"
     if schema_type == "array":
-        schema_type = field.get('items').get('type')
+        items_type = field.get('items').get('type')
+        schema_type = items_type[-1] if isinstance(items_type, list) else items_type
         schema_mode = "REPEATED"
         if schema_type == "object":
-          schema_type = "RECORD"
-          schema_fields = tuple(build_schema(field.get('items')))
-
-
+            schema_type = "RECORD"
+            schema_fields = tuple(build_schema(field.get('items')))
     if schema_type == "string":
         if "format" in field:
             if field['format'] == "date-time":
                 schema_type = "timestamp"
-
     if schema_type == 'number':
         schema_type = 'FLOAT'
 
     return (schema_name, schema_type, schema_mode, schema_description, schema_fields)
 
+
 def build_schema(schema):
     SCHEMA = []
     for key in schema['properties'].keys():
-        
+
         if not (bool(schema['properties'][key])):
             # if we endup with an empty record.
             continue
 
-        schema_name, schema_type, schema_mode, schema_description, schema_fields = define_schema(schema['properties'][key], key)
-        SCHEMA.append(SchemaField(schema_name, schema_type, schema_mode, schema_description, schema_fields))
+        try:
+            schema_name, schema_type, schema_mode, schema_description, schema_fields = define_schema(
+                schema['properties'][key], key)
+            SCHEMA.append(SchemaField(schema_name, schema_type, schema_mode, schema_description, schema_fields))
+        except:
+            pass
 
     return SCHEMA
+
 
 def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, validate_records=True):
     state = None
@@ -131,7 +148,8 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
 
         if isinstance(msg, singer.RecordMessage):
             if msg.stream not in schemas:
-                raise Exception("A record for stream {} was encountered before a corresponding schema".format(msg.stream))
+                raise Exception(
+                    "A record for stream {} was encountered before a corresponding schema".format(msg.stream))
 
             schema = schemas[msg.stream]
 
@@ -142,7 +160,7 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
             dat = bytes(json.dumps(msg.record) + '\n', 'UTF-8')
 
             rows[msg.stream].write(dat)
-            #rows[msg.stream].write(bytes(str(msg.record) + '\n', 'UTF-8'))
+            # rows[msg.stream].write(bytes(str(msg.record) + '\n', 'UTF-8'))
 
             state = None
 
@@ -151,10 +169,10 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
             state = msg.value
 
         elif isinstance(msg, singer.SchemaMessage):
-            table = msg.stream 
+            table = msg.stream
             schemas[table] = msg.schema
             key_properties[table] = msg.key_properties
-            #tables[table] = bigquery.Table(dataset.table(table), schema=build_schema(schemas[table]))
+            # tables[table] = bigquery.Table(dataset.table(table), schema=build_schema(schemas[table]))
             rows[table] = TemporaryFile(mode='w+b')
             errors[table] = None
             # try:
@@ -186,7 +204,6 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
         logger.info("loading job {}".format(load_job.job_id))
         logger.info(load_job.result())
 
-
     # for table in errors.keys():
     #     if not errors[table]:
     #         print('Loaded {} row(s) into {}:{}'.format(rows[table], dataset_id, table), tables[table].path)
@@ -194,6 +211,22 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
     #         print('Errors:', errors[table], sep=" ")
 
     return state
+
+
+def apply_string_conversions(record: dict, schema: List[SchemaField], stream):
+    for schema_field in schema:
+        # if isinstance(record, list):
+        rec_field = record.get(schema_field.name)
+        if rec_field:
+            if schema_field.field_type == "STRING":
+                record[schema_field.name] = str(rec_field)
+            elif schema_field.field_type in ["RECORD", "STRUCT"]:
+                if schema_field.mode == "REPEATED":
+                    record[schema_field.name] = [apply_string_conversions(rec_item, schema_field.fields, stream + "." + schema_field.name) for rec_item in rec_field]
+                else:
+                    record[schema_field.name] = apply_string_conversions(rec_field, schema_field.fields, stream + "." + schema_field.name)
+    return record
+
 
 def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=True):
     state = None
@@ -221,14 +254,17 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
 
         if isinstance(msg, singer.RecordMessage):
             if msg.stream not in schemas:
-                raise Exception("A record for stream {} was encountered before a corresponding schema".format(msg.stream))
+                raise Exception(
+                    "A record for stream {} was encountered before a corresponding schema".format(msg.stream))
 
             schema = schemas[msg.stream]
 
             if validate_records:
                 validate(msg.record, schema)
 
-            errors[msg.stream] = bigquery_client.insert_rows_json(tables[msg.stream], [msg.record])
+            msg.record = apply_string_conversions(msg.record, tables[msg.stream].schema, msg.stream)
+            errors[msg.stream] = bigquery_client.insert_rows_json(tables[msg.stream], [msg.record],
+                                                                  ignore_unknown_values=True)
             rows[msg.stream] += 1
 
             state = None
@@ -238,7 +274,7 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
             state = msg.value
 
         elif isinstance(msg, singer.SchemaMessage):
-            table = msg.stream 
+            table = msg.stream
             schemas[table] = msg.schema
             key_properties[table] = msg.key_properties
             tables[table] = bigquery.Table(dataset.table(table), schema=build_schema(schemas[table]))
@@ -261,9 +297,10 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
             logging.info('Loaded {} row(s) into {}:{}'.format(rows[table], dataset_id, table, tables[table].path))
             emit_state(state)
         else:
-            logging.error('Errors:', errors[table], sep=" ")
+            logging.error('Errors:', errors[table])
 
     return state
+
 
 def collect():
     try:
@@ -282,6 +319,7 @@ def collect():
         conn.close()
     except:
         logger.debug('Collection request failed')
+
 
 def main():
     with open(flags.config) as input:
@@ -303,9 +341,11 @@ def main():
     input = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
 
     if config.get('stream_data', True):
-        state = persist_lines_stream(config['project_id'], config['dataset_id'], input, validate_records=validate_records)
+        state = persist_lines_stream(config['project_id'], config['dataset_id'], input,
+                                     validate_records=validate_records)
     else:
-        state = persist_lines_job(config['project_id'], config['dataset_id'], input, truncate=truncate, validate_records=validate_records)
+        state = persist_lines_job(config['project_id'], config['dataset_id'], input, truncate=truncate,
+                                  validate_records=validate_records)
 
     emit_state(state)
     logger.debug("Exiting normally")
