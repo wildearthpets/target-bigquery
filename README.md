@@ -55,6 +55,14 @@ It should be possible to use the oAuth flow to authenticate to GCP as well:
 
 The data will be written to the table specified in your `config.json`.
 
+### JSON Schema compatibility
+
+Singer taps use JSON Schema to describe/validate the data they produce.
+However the [patternProperties](https://json-schema.org/understanding-json-schema/reference/object.html#pattern-properties) 
+feature of this schema standard is not really applicable to BigQuery JSON schema structure. 
+As a workaround we simply convert the values of fields using `patternProperties` to string before loading.
+These columns can then be worked on with [BigQuery JSON functions](https://cloud.google.com/bigquery/docs/reference/standard-sql/json_functions).
+
 ---
 
 Copyright &copy; 2018 RealSelf, Inc.
