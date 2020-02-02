@@ -7,39 +7,101 @@ import http.client
 import io
 import json
 import logging
+import os
 import re
 import sys
 import threading
 import urllib
 from tempfile import TemporaryFile
 
+import boto3
 import pkg_resources
 import singer
 from google.api_core import exceptions
-from google.cloud import bigquery
+from google.api_core.exceptions import NotFound
+from google.cloud import bigquery, storage
 from google.cloud.bigquery import Dataset, WriteDisposition
 from google.cloud.bigquery import LoadJobConfig
 from google.cloud.bigquery import SchemaField
 from google.cloud.bigquery.job import SourceFormat
+from google.oauth2 import service_account
 from jsonschema import validate
 from oauth2client import tools
+
+
+def get_param(key):
+    ssm = boto3.client('ssm', region_name='eu-west-1')
+    parameter = ssm.get_parameter(Name=key, WithDecryption=True)
+    return parameter['Parameter']['Value']
+
+
+def get_with_aws(value, env):
+    if value.startswith("aws"):
+        return get_param(f'/{env}/{value}')
+
 
 try:
     parser = argparse.ArgumentParser(parents=[tools.argparser])
     parser.add_argument('-c', '--config', help='Config file', required=True)
+    parser.add_argument('-e', '--env', help='Environment', required=True)
     flags = parser.parse_args()
 
 except ImportError:
     flags = None
 
+with open(flags.config) as input:
+    config = {k: get_with_aws(v, flags.env) for k, v in json.load(input)}
+
 logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
 logger = singer.get_logger()
 
-SCOPES = ['https://www.googleapis.com/auth/bigquery', 'https://www.googleapis.com/auth/bigquery.insertdata']
-CLIENT_SECRET_FILE = 'client_secret.json'
+SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+CLIENT_SECRET_FILE = '.credentials/gcloud.json'
 APPLICATION_NAME = 'Singer BigQuery Target'
 
+PROJECT_ID = config.get('project_id')
+DATASET_ID = config.get('dataset_id')
+
+STATE_BUCKET = config.get('gcs_state_bucket')
+STATE_BLOB = config.get('gcs_state_blob')
+
 StreamMeta = collections.namedtuple('StreamMeta', ['schema', 'key_properties', 'bookmark_properties'])
+
+
+def get_abs_path(path):
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), path)
+
+
+credentials = service_account.Credentials.from_service_account_file(get_abs_path(CLIENT_SECRET_FILE), scopes=SCOPES)
+STORAGE_CLIENT = storage.Client(credentials=credentials, project=PROJECT_ID)
+
+BIGQUERY_CLIENT = bigquery.Client(credentials=credentials, project=PROJECT_ID)
+
+
+def sync_state_for_table(table_name, new_state):
+    sync_state = {'currently_syncing': None, 'bookmarks': {}}
+
+    bucket = STORAGE_CLIENT.bucket(STATE_BUCKET)
+    blob = bucket.blob(STATE_BLOB)
+    try:
+        old_state = json.loads(blob.download_as_string())
+    except NotFound:
+        old_state = {}
+
+    sync_state['currently_syncing'] = new_state['currently_syncing']
+    for key in new_state['bookmarks']:
+        if key == table_name:
+            sync_state['bookmarks'][key] = new_state['bookmarks'][key]
+        else:
+            sync_state['bookmarks'][key] = old_state.get('bookmarks', {}).get(key, None)
+
+    blob.upload_from_string(json.dumps(sync_state))
+
+
+def sync_state(state):
+    bucket = STORAGE_CLIENT.bucket(STATE_BUCKET)
+    blob = bucket.blob(STATE_BLOB)
+    blob.upload_from_string(json.dumps(state))
 
 
 def emit_state(state):
@@ -107,7 +169,7 @@ def define_schema(field, name):
     if schema_type == 'number':
         schema_type = 'FLOAT'
 
-    return (schema_name, schema_type, schema_mode, schema_description, schema_fields)
+    return schema_name, schema_type, schema_mode, schema_description, schema_fields
 
 
 def build_schema(schema):
@@ -160,7 +222,7 @@ def apply_decimal_conversions(record):
     return new_record
 
 
-def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, validate_records=True):
+def persist_lines_job(lines=None, truncate=False, validate_records=True):
     state = None
     schemas = {}
     key_properties = {}
@@ -168,10 +230,8 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
     rows = {}
     errors = {}
 
-    bigquery_client = bigquery.Client(project=project_id)
-
     # try:
-    #     dataset = bigquery_client.create_dataset(Dataset(dataset_ref)) or Dataset(dataset_ref)
+    #     dataset = BIGQUERY_CLIENT.create_dataset(Dataset(dataset_ref)) or Dataset(dataset_ref)
     # except exceptions.Conflict:
     #     pass
 
@@ -214,7 +274,7 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
             rows[table] = TemporaryFile(mode='w+b')
             errors[table] = None
             # try:
-            #     tables[table] = bigquery_client.create_table(tables[table])
+            #     tables[table] = BIGQUERY_CLIENT.create_table(tables[table])
             # except exceptions.Conflict:
             #     pass
 
@@ -226,7 +286,7 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
             raise Exception("Unrecognized message {}".format(msg))
 
     for table in rows.keys():
-        table_ref = bigquery_client.dataset(dataset_id).table(fix_name(table))
+        table_ref = BIGQUERY_CLIENT.dataset(DATASET_ID).table(fix_name(table))
         load_config = LoadJobConfig()
         load_config.schema = bq_schemas[table]
         load_config.source_format = SourceFormat.NEWLINE_DELIMITED_JSON
@@ -234,23 +294,27 @@ def persist_lines_job(project_id, dataset_id, lines=None, truncate=False, valida
         if truncate:
             load_config.write_disposition = WriteDisposition.WRITE_TRUNCATE
 
+        rows[table].seek(0, os.SEEK_END)
+        if rows[table].tell() == 0:
+            continue
         rows[table].seek(0)
         logger.info("loading {} to Bigquery.\n".format(table))
-        load_job = bigquery_client.load_table_from_file(
+        load_job = BIGQUERY_CLIENT.load_table_from_file(
             rows[table], table_ref, job_config=load_config)
         logger.info("loading job {}".format(load_job.job_id))
         logger.info(load_job.result())
+        sync_state_for_table(table, state)
 
     # for table in errors.keys():
     #     if not errors[table]:
-    #         print('Loaded {} row(s) into {}:{}'.format(rows[table], dataset_id, table), tables[table].path)
+    #         print('Loaded {} row(s) into {}:{}'.format(rows[table], DATASET_ID, table), tables[table].path)
     #     else:
     #         print('Errors:', errors[table], sep=" ")
 
     return state
 
 
-def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=True):
+def persist_lines_stream(lines=None, validate_records=True):
     state = None
     schemas = {}
     key_properties = {}
@@ -258,12 +322,10 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
     rows = {}
     errors = {}
 
-    bigquery_client = bigquery.Client(project=project_id)
-
-    dataset_ref = bigquery_client.dataset(dataset_id)
+    dataset_ref = BIGQUERY_CLIENT.dataset(DATASET_ID)
     dataset = Dataset(dataset_ref)
     try:
-        dataset = bigquery_client.create_dataset(Dataset(dataset_ref)) or Dataset(dataset_ref)
+        dataset = BIGQUERY_CLIENT.create_dataset(Dataset(dataset_ref)) or Dataset(dataset_ref)
     except exceptions.Conflict:
         pass
 
@@ -286,7 +348,7 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
 
             msg.record = apply_string_conversions(msg.record, tables[msg.stream].schema)
             msg.record = apply_decimal_conversions(msg.record)
-            errors[msg.stream] = bigquery_client.insert_rows_json(tables[msg.stream], [msg.record])
+            errors[msg.stream] = BIGQUERY_CLIENT.insert_rows_json(tables[msg.stream], [msg.record])
             rows[msg.stream] += 1
 
             state = None
@@ -294,6 +356,8 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
         elif isinstance(msg, singer.StateMessage):
             logger.debug('Setting state to {}'.format(msg.value))
             state = msg.value
+            sync_state(state)
+            emit_state(state)
 
         elif isinstance(msg, singer.SchemaMessage):
             table = msg.stream
@@ -303,7 +367,7 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
             rows[table] = 0
             errors[table] = None
             try:
-                tables[table] = bigquery_client.create_table(tables[table])
+                tables[table] = BIGQUERY_CLIENT.create_table(tables[table])
             except exceptions.Conflict:
                 pass
 
@@ -316,7 +380,7 @@ def persist_lines_stream(project_id, dataset_id, lines=None, validate_records=Tr
 
     for table in errors.keys():
         if not errors[table]:
-            logging.info('Loaded {} row(s) into {}:{}'.format(rows[table], dataset_id, table, tables[table].path))
+            logging.info('Loaded {} row(s) into {}:{}'.format(rows[table], DATASET_ID, table, tables[table].path))
             emit_state(state)
         else:
             logging.error('Errors:', str(errors[table]))
@@ -344,9 +408,6 @@ def collect():
 
 
 def main():
-    with open(flags.config) as input:
-        config = json.load(input)
-
     if not config.get('disable_collection', False):
         logger.info('Sending version information to stitchdata.com. ' +
                     'To disable sending anonymous usage data, set ' +
@@ -363,13 +424,14 @@ def main():
     input = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
 
     if config.get('stream_data', True):
-        state = persist_lines_stream(config['project_id'], config['dataset_id'], input,
-                                     validate_records=validate_records)
+        state = persist_lines_stream(input, validate_records=validate_records)
     else:
-        state = persist_lines_job(config['project_id'], config['dataset_id'], input, truncate=truncate,
-                                  validate_records=validate_records)
+        state = persist_lines_job(input, truncate=truncate, validate_records=validate_records)
 
     emit_state(state)
+    # if flags.state and state:
+    #     with open(flags.state, 'w') as f:
+    #         f.write(json.dumps(state))
     logger.debug("Exiting normally")
 
 
