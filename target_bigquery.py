@@ -6,6 +6,7 @@ import decimal
 import http.client
 import io
 import json
+import simplejson
 import logging
 import os
 import re
@@ -14,7 +15,6 @@ import threading
 import urllib
 from tempfile import TemporaryFile
 
-import boto3
 import pkg_resources
 import singer
 from google.api_core import exceptions
@@ -28,35 +28,22 @@ from google.oauth2 import service_account
 from jsonschema import validate
 from oauth2client import tools
 
-
-def get_param(key):
-    ssm = boto3.client('ssm', region_name='eu-west-1')
-    parameter = ssm.get_parameter(Name=key, WithDecryption=True)
-    return parameter['Parameter']['Value']
-
-
-def get_with_aws(value, env):
-    if value.startswith("aws"):
-        return get_param(f'/{env}/{value}')
-
-
 try:
     parser = argparse.ArgumentParser(parents=[tools.argparser])
     parser.add_argument('-c', '--config', help='Config file', required=True)
-    parser.add_argument('-e', '--env', help='Environment', required=True)
     flags = parser.parse_args()
 
 except ImportError:
     flags = None
 
 with open(flags.config) as input:
-    config = {k: get_with_aws(v, flags.env) for k, v in json.load(input)}
+    config = json.load(input)
 
 logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
 logger = singer.get_logger()
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
-CLIENT_SECRET_FILE = '.credentials/gcloud.json'
+CLIENT_SECRET_FILE = config.get('client_secrets') or '.credentials/gcloud.json'
 APPLICATION_NAME = 'Singer BigQuery Target'
 
 PROJECT_ID = config.get('project_id')
@@ -219,6 +206,7 @@ def apply_decimal_conversions(record):
         if isinstance(value, decimal.Decimal):
             value = float(value)
         new_record[fix_name(key)] = value
+    new_record = simplejson.loads(simplejson.dumps(new_record, use_decimal=True))
     return new_record
 
 
